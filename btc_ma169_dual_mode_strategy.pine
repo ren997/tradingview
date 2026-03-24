@@ -1,0 +1,278 @@
+//@version=6
+strategy(
+     "BTC MA169 Dual-Mode Strategy",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     commission_type=strategy.commission.percent,
+     commission_value=0.05
+)
+
+// ===== 参数 =====
+maLen                  = input.int(169, "MA169长度", minval=1)
+maTrendLen             = input.int(200, "MA200长度", minval=1)
+adxLen                 = input.int(14, "ADX长度", minval=1)
+adxSmoothing           = input.int(14, "ADX平滑", minval=1)
+adxMin                 = input.float(18.0, "趋势最低ADX", step=0.5)
+atrLen                 = input.int(14, "ATR长度", minval=1)
+minGapPct              = input.float(0.20, "MA169与MA200最小间距(%)", step=0.01) / 100
+trendSlopeBars         = input.int(3, "MA169趋势确认根数", minval=1)
+chopLookback           = input.int(12, "震荡检测回看K数", minval=2)
+maxCrossesInWindow     = input.int(2, "震荡区允许穿越169次数", minval=0)
+flatAtrThreshold       = input.float(0.35, "MA169走平阈值(ATR倍数)", step=0.05, minval=0)
+
+allowLongPullback      = input.bool(true, "启用趋势回踩做多")
+allowShortRetest       = input.bool(true, "启用跌破反抽做空")
+allowBreakoutLong      = input.bool(true, "启用盘整带量突破做多")
+maxTrendRetests        = input.int(2, "趋势中最多做前几次回踩/反抽", minval=1)
+touchAtrTolerance      = input.float(0.20, "回踩贴近169容差(ATR倍数)", step=0.05, minval=0)
+pullbackPierceAtr      = input.float(0.50, "回踩允许穿透169深度(ATR倍数)", step=0.05, minval=0)
+
+consolidationLookback  = input.int(18, "盘整突破回看K数", minval=5)
+baseBelowRatio         = input.float(0.70, "盘整区收盘在169下方比例", step=0.05, minval=0.5, maxval=1)
+maxBaseRangeAtr        = input.float(6.0, "盘整区最大范围(ATR倍数)", step=0.5, minval=1)
+baseMaFlatAtr          = input.float(1.20, "盘整期MA169走平阈值(ATR倍数)", step=0.1, minval=0)
+breakoutVolumeMult     = input.float(1.40, "突破放量倍数", step=0.1, minval=1)
+volumeLen              = input.int(20, "成交量均线长度", minval=1)
+
+stopAtrMultTrend       = input.float(0.50, "趋势单止损ATR倍数", step=0.1, minval=0)
+stopAtrMultBreakout    = input.float(0.80, "突破单止损ATR倍数", step=0.1, minval=0)
+tp1RR                  = input.float(1.0, "第一止盈RR", step=0.1, minval=0.1)
+tp1QtyPct              = input.float(40.0, "第一止盈仓位(%)", step=1, minval=1, maxval=99)
+moveStopToBreakeven    = input.bool(true, "第一止盈后提保本")
+trailAtrAfterTp1       = input.float(0.30, "第一止盈后沿169跟踪(ATR倍数)", step=0.05, minval=0)
+
+enableLogs             = input.bool(false, "启用调试日志")
+
+// ===== 指标 =====
+ma169       = ta.sma(close, maLen)
+ma200       = ta.sma(close, maTrendLen)
+atrValue    = ta.atr(atrLen)
+[_plusDI, _minusDI, adxValue] = ta.dmi(adxLen, adxSmoothing)
+volumeAvg   = ta.sma(volume, volumeLen)
+gapAbsPct   = math.abs(ma169 - ma200) / ma200
+maFlatAtr   = math.abs(ma169 - ma169[chopLookback]) / atrValue
+maRisingTrend = ta.rising(ma169, trendSlopeBars)
+maFallingTrend = ta.falling(ma169, trendSlopeBars)
+crossEvent = ta.cross(close, ma169)
+crossCount  = ta.sum(crossEvent ? 1.0 : 0.0, chopLookback)
+
+plot(ma169, "MA169", color=color.green, linewidth=2)
+plot(ma200, "MA200", color=color.red, linewidth=2)
+
+// ===== 市场状态 =====
+bullTrend = close > ma169 and ma169 > ma200 and maRisingTrend and adxValue > adxMin and gapAbsPct > minGapPct
+bearTrend = close < ma169 and ma169 < ma200 and maFallingTrend and adxValue > adxMin and gapAbsPct > minGapPct
+isChoppy  = crossCount > maxCrossesInWindow or (adxValue < adxMin and maFlatAtr < flatAtrThreshold) or gapAbsPct <= minGapPct
+
+bgcolor(isChoppy ? color.new(color.gray, 92) : na, title="震荡过滤区")
+
+// ===== 趋势回踩 / 反抽状态 =====
+var int bullPullbackCount = 0
+var int bearRetestCount   = 0
+
+if bullTrend and not bullTrend[1]
+    bullPullbackCount := 0
+
+if bearTrend and not bearTrend[1]
+    bearRetestCount := 0
+
+bullTouch = low <= ma169 + atrValue * touchAtrTolerance and low >= ma169 - atrValue * pullbackPierceAtr and close > ma169
+bearTouch = high >= ma169 - atrValue * touchAtrTolerance and high <= ma169 + atrValue * pullbackPierceAtr and close < ma169
+
+newBullTouch = bullTrend and bullTouch and not bullTouch[1]
+newBearTouch = bearTrend and bearTouch and not bearTouch[1]
+
+if newBullTouch
+    bullPullbackCount += 1
+
+if newBearTouch
+    bearRetestCount += 1
+
+longPullbackSignal =
+     allowLongPullback and
+     strategy.position_size == 0 and
+     not isChoppy and
+     newBullTouch and
+     bullPullbackCount <= maxTrendRetests and
+     close > open
+
+shortRetestSignal =
+     allowShortRetest and
+     strategy.position_size == 0 and
+     not isChoppy and
+     newBearTouch and
+     bearRetestCount <= maxTrendRetests and
+     close < open
+
+// ===== 盘整带量突破 =====
+priorRangeHigh = ta.highest(high[1], consolidationLookback)
+priorRangeLow  = ta.lowest(low[1], consolidationLookback)
+belowCount     = ta.sum(close[1] < ma169[1] ? 1.0 : 0.0, consolidationLookback)
+baseBelowOk    = belowCount / consolidationLookback >= baseBelowRatio
+baseTightOk    = not na(priorRangeHigh) and not na(priorRangeLow) and (priorRangeHigh - priorRangeLow) / atrValue <= maxBaseRangeAtr
+baseFlatOk     = math.abs(ma169 - ma169[consolidationLookback]) / atrValue <= baseMaFlatAtr
+breakoutVolOk  = volume > volumeAvg * breakoutVolumeMult
+breakoutBodyOk = close > open and close > priorRangeHigh and close > ma169
+breakoutTrendOk = ma169 >= ma169[1] and close > ma200
+
+breakoutLongSignal =
+     allowBreakoutLong and
+     strategy.position_size == 0 and
+     baseBelowOk and
+     baseTightOk and
+     baseFlatOk and
+     breakoutVolOk and
+     breakoutBodyOk and
+     breakoutTrendOk
+
+// ===== 仓位状态 =====
+var int   activeMode      = 0   // 1=趋势多, 2=突破多, -1=趋势空
+var float activeStop      = na
+var float signalLow       = na
+var float signalHigh      = na
+var float tp1Price        = na
+var bool  tp1Hit          = false
+
+// ===== 调试日志 =====
+if enableLogs and (longPullbackSignal or shortRetestSignal or breakoutLongSignal)
+    log.info(
+         "信号出现 | t={0} longPullback={1} breakoutLong={2} shortRetest={3} bullTrend={4} bearTrend={5} choppy={6} adx={7} crossCount={8} close={9} ma169={10} ma200={11}",
+         str.format_time(time, "yyyy-MM-dd HH:mm"),
+         longPullbackSignal,
+         breakoutLongSignal,
+         shortRetestSignal,
+         bullTrend,
+         bearTrend,
+         isChoppy,
+         adxValue,
+         crossCount,
+         close,
+         ma169,
+         ma200
+    )
+
+// ===== 入场 =====
+if longPullbackSignal
+    activeMode := 1
+    signalLow := low
+    signalHigh := na
+    activeStop := low - atrValue * stopAtrMultTrend
+    tp1Hit := false
+    strategy.entry("Long", strategy.long, comment="Trend Pullback Long")
+    strategy.exit("L-Init", from_entry="Long", stop=activeStop)
+    if enableLogs
+        log.info(
+             "趋势回踩做多 | t={0} signalLow={1} stop={2} pullbackCount={3}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             signalLow,
+             activeStop,
+             bullPullbackCount
+        )
+
+if breakoutLongSignal
+    activeMode := 2
+    signalLow := low
+    signalHigh := na
+    activeStop := low - atrValue * stopAtrMultBreakout
+    tp1Hit := false
+    strategy.entry("Long", strategy.long, comment="Base Breakout Long")
+    strategy.exit("L-Init", from_entry="Long", stop=activeStop)
+    if enableLogs
+        log.info(
+             "盘整突破做多 | t={0} signalLow={1} stop={2} volume={3} volumeAvg={4}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             signalLow,
+             activeStop,
+             volume,
+             volumeAvg
+        )
+
+if shortRetestSignal
+    activeMode := -1
+    signalHigh := high
+    signalLow := na
+    activeStop := high + atrValue * stopAtrMultTrend
+    tp1Hit := false
+    strategy.entry("Short", strategy.short, comment="Trend Retest Short")
+    strategy.exit("S-Init", from_entry="Short", stop=activeStop)
+    if enableLogs
+        log.info(
+             "反抽169做空 | t={0} signalHigh={1} stop={2} retestCount={3}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             signalHigh,
+             activeStop,
+             bearRetestCount
+        )
+
+// ===== 持仓管理 =====
+if strategy.position_size > 0 and not na(activeStop)
+    longRisk = strategy.position_avg_price - activeStop
+    tp1Price := strategy.position_avg_price + longRisk * tp1RR
+    if high >= tp1Price
+        tp1Hit := true
+    runnerStopLong = activeStop
+    if tp1Hit
+        if moveStopToBreakeven
+            runnerStopLong := math.max(runnerStopLong, strategy.position_avg_price)
+        runnerStopLong := math.max(runnerStopLong, ma169 - atrValue * trailAtrAfterTp1)
+    strategy.exit("L-TP1", from_entry="Long", limit=tp1Price, stop=activeStop, qty_percent=tp1QtyPct)
+    strategy.exit("L-Runner", from_entry="Long", stop=runnerStopLong, qty_percent=100 - tp1QtyPct)
+    if enableLogs and tp1Hit and not tp1Hit[1]
+        log.info(
+             "多单第一止盈触发 | t={0} avgPrice={1} tp1Price={2} runnerStop={3} mode={4}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             strategy.position_avg_price,
+             tp1Price,
+             runnerStopLong,
+             activeMode
+        )
+
+if strategy.position_size < 0 and not na(activeStop)
+    shortRisk = activeStop - strategy.position_avg_price
+    tp1Price := strategy.position_avg_price - shortRisk * tp1RR
+    if low <= tp1Price
+        tp1Hit := true
+    runnerStopShort = activeStop
+    if tp1Hit
+        if moveStopToBreakeven
+            runnerStopShort := math.min(runnerStopShort, strategy.position_avg_price)
+        runnerStopShort := math.min(runnerStopShort, ma169 + atrValue * trailAtrAfterTp1)
+    strategy.exit("S-TP1", from_entry="Short", limit=tp1Price, stop=activeStop, qty_percent=tp1QtyPct)
+    strategy.exit("S-Runner", from_entry="Short", stop=runnerStopShort, qty_percent=100 - tp1QtyPct)
+    if enableLogs and tp1Hit and not tp1Hit[1]
+        log.info(
+             "空单第一止盈触发 | t={0} avgPrice={1} tp1Price={2} runnerStop={3}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             strategy.position_avg_price,
+             tp1Price,
+             runnerStopShort
+        )
+
+// ===== 平仓后重置 =====
+justClosedLong  = strategy.position_size == 0 and strategy.position_size[1] > 0
+justClosedShort = strategy.position_size == 0 and strategy.position_size[1] < 0
+
+if justClosedLong or justClosedShort
+    if enableLogs
+        log.info(
+             "持仓结束 | t={0} prevMode={1} prevStop={2} prevTp1={3} close={4}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             activeMode,
+             activeStop,
+             tp1Price,
+             close
+        )
+    activeMode := 0
+    activeStop := na
+    signalLow := na
+    signalHigh := na
+    tp1Price := na
+    tp1Hit := false
+
+// ===== 图形标记 =====
+plotshape(longPullbackSignal, title="趋势回踩做多", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="PB多")
+plotshape(breakoutLongSignal, title="盘整突破做多", style=shape.triangleup, location=location.belowbar, color=color.yellow, size=size.small, text="突多")
+plotshape(shortRetestSignal, title="反抽169做空", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="空")
+plotshape(isChoppy, title="震荡过滤", style=shape.circle, location=location.bottom, color=color.new(color.gray, 10), size=size.tiny, text="震")
