@@ -56,7 +56,7 @@ maFlatAtr   = math.abs(ma169 - ma169[chopLookback]) / atrValue
 maRisingTrend = ta.rising(ma169, trendSlopeBars)
 maFallingTrend = ta.falling(ma169, trendSlopeBars)
 crossEvent = ta.cross(close, ma169)
-crossCount  = ta.sum(crossEvent ? 1.0 : 0.0, chopLookback)
+crossCount  = math.sum(crossEvent ? 1.0 : 0.0, chopLookback)
 
 plot(ma169, "MA169", color=color.green, linewidth=2)
 plot(ma200, "MA200", color=color.red, linewidth=2)
@@ -109,7 +109,7 @@ shortRetestSignal =
 // ===== 盘整带量突破 =====
 priorRangeHigh = ta.highest(high[1], consolidationLookback)
 priorRangeLow  = ta.lowest(low[1], consolidationLookback)
-belowCount     = ta.sum(close[1] < ma169[1] ? 1.0 : 0.0, consolidationLookback)
+belowCount     = math.sum(close[1] < ma169[1] ? 1.0 : 0.0, consolidationLookback)
 baseBelowOk    = belowCount / consolidationLookback >= baseBelowRatio
 baseTightOk    = not na(priorRangeHigh) and not na(priorRangeLow) and (priorRangeHigh - priorRangeLow) / atrValue <= maxBaseRangeAtr
 baseFlatOk     = math.abs(ma169 - ma169[consolidationLookback]) / atrValue <= baseMaFlatAtr
