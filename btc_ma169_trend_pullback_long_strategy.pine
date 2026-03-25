@@ -1,0 +1,175 @@
+//@version=6
+strategy(
+     "BTC MA169 Trend Pullback Long",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     commission_type=strategy.commission.percent,
+     commission_value=0.05
+)
+
+// 中文说明：
+// 这是“趋势回踩 MA169 做多”的独立策略文件。
+// 如果你现在准备继续专注优化 4 小时级别的回踩做多，最推荐从这个文件继续改。
+// 它比 dual_mode 更干净，也比后面那些突破/洗盘实验版更贴近你当前认可的方向。
+
+// ===== 参数 =====
+maLen                  = input.int(169, "MA169长度", minval=1)
+maTrendLen             = input.int(200, "MA200长度", minval=1)
+adxLen                 = input.int(14, "ADX长度", minval=1)
+adxSmoothing           = input.int(14, "ADX平滑", minval=1)
+adxMin                 = input.float(18.0, "趋势最低ADX", step=0.5)
+atrLen                 = input.int(14, "ATR长度", minval=1)
+minGapPct              = input.float(0.20, "MA169与MA200最小间距(%)", step=0.01) / 100
+trendSlopeBars         = input.int(3, "MA169趋势确认根数", minval=1)
+chopLookback           = input.int(12, "震荡检测回看K数", minval=2)
+maxCrossesInWindow     = input.int(2, "震荡区允许穿越169次数", minval=0)
+flatAtrThreshold       = input.float(0.35, "MA169走平阈值(ATR倍数)", step=0.05, minval=0)
+maxTrendRetests        = input.int(2, "趋势中最多做前几次回踩", minval=1)
+touchAtrTolerance      = input.float(0.20, "回踩贴近169容差(ATR倍数)", step=0.05, minval=0)
+pullbackPierceAtr      = input.float(0.50, "回踩允许穿透169深度(ATR倍数)", step=0.05, minval=0)
+recentBelowLookback    = input.int(8, "回踩前最近跌破169回看K数", minval=1)
+maxRecentClosesBelow   = input.int(0, "回踩前允许收在169下方次数", minval=0)
+extensionLookback      = input.int(48, "回踩前拉升回看K数", minval=1)
+maxExtensionAtr        = input.float(6.0, "回踩前最高拉升距169最大ATR", step=0.5, minval=0.5)
+
+stopAtrMultTrend       = input.float(0.50, "趋势单止损ATR倍数", step=0.1, minval=0)
+tp1RR                  = input.float(1.0, "第一止盈RR", step=0.1, minval=0.1)
+tp1QtyPct              = input.float(40.0, "第一止盈仓位(%)", step=1, minval=1, maxval=99)
+moveStopToBreakeven    = input.bool(true, "第一止盈后提保本")
+trailAtrAfterTp1       = input.float(0.30, "第一止盈后沿169跟踪(ATR倍数)", step=0.05, minval=0)
+
+enableLogs             = input.bool(false, "启用调试日志")
+logPositionState       = input.bool(true, "记录持仓关键状态")
+runnerLogStepAtr       = input.float(0.50, "Runner止损变动超过多少ATR记录", step=0.1, minval=0.1)
+
+// ===== 指标 =====
+ma169       = ta.sma(close, maLen)
+ma200       = ta.sma(close, maTrendLen)
+atrValue    = ta.atr(atrLen)
+[_plusDI, _minusDI, adxValue] = ta.dmi(adxLen, adxSmoothing)
+gapAbsPct   = math.abs(ma169 - ma200) / ma200
+maFlatAtr   = math.abs(ma169 - ma169[chopLookback]) / atrValue
+maRisingTrend = ta.rising(ma169, trendSlopeBars)
+crossEvent = ta.cross(close, ma169)
+crossCount  = math.sum(crossEvent ? 1.0 : 0.0, chopLookback)
+
+plot(ma169, "MA169", color=color.green, linewidth=2)
+plot(ma200, "MA200", color=color.red, linewidth=2)
+
+// ===== 市场状态 =====
+bullTrend = close > ma169 and ma169 > ma200 and maRisingTrend and adxValue > adxMin and gapAbsPct > minGapPct
+isChoppy  = crossCount > maxCrossesInWindow or (adxValue < adxMin and maFlatAtr < flatAtrThreshold) or gapAbsPct <= minGapPct
+
+bgcolor(isChoppy ? color.new(color.gray, 92) : na, title="震荡过滤区")
+
+// ===== 趋势回踩状态 =====
+var int bullPullbackCount = 0
+
+if bullTrend and not bullTrend[1]
+    bullPullbackCount := 0
+
+bullTouch = low <= ma169 + atrValue * touchAtrTolerance and low >= ma169 - atrValue * pullbackPierceAtr and close > ma169
+newBullTouch = bullTrend and bullTouch and not bullTouch[1]
+recentClosesBelow = math.sum(close[1] < ma169[1] ? 1.0 : 0.0, recentBelowLookback)
+recentReclaimOk = recentClosesBelow <= maxRecentClosesBelow
+prePullbackStretchAtr = (ta.highest(high[1], extensionLookback) - ma169) / atrValue
+extensionOk = prePullbackStretchAtr <= maxExtensionAtr
+
+if newBullTouch
+    bullPullbackCount += 1
+
+longPullbackSignal =
+     strategy.position_size == 0 and
+     not isChoppy and
+     newBullTouch and
+     bullPullbackCount <= maxTrendRetests and
+     recentReclaimOk and
+     extensionOk and
+     close > open
+
+// ===== 仓位状态 =====
+var float activeStop = na
+var float activeRunnerStopLong = na
+var float signalLow = na
+var float tp1Price = na
+var bool  tp1Hit = false
+var float lastLoggedRunnerStopLong = na
+
+// ===== 入场 =====
+if longPullbackSignal
+    signalLow := low
+    activeStop := low - atrValue * stopAtrMultTrend
+    activeRunnerStopLong := activeStop
+    tp1Hit := false
+    lastLoggedRunnerStopLong := na
+    strategy.entry("Long", strategy.long, comment="Trend Pullback Long")
+    strategy.exit("L-Init", from_entry="Long", stop=activeStop)
+    if enableLogs
+        log.info(
+             "趋势回踩做多 | t={0} signalLow={1} stop={2} pullbackCount={3} recentClosesBelow={4} stretchAtr={5}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             signalLow,
+             activeStop,
+             bullPullbackCount,
+             recentClosesBelow,
+             prePullbackStretchAtr
+        )
+
+// ===== 持仓管理 =====
+if strategy.position_size > 0 and not na(activeStop)
+    longRisk = strategy.position_avg_price - activeStop
+    tp1Price := strategy.position_avg_price + longRisk * tp1RR
+    if high >= tp1Price
+        tp1Hit := true
+    runnerStopLong = na(activeRunnerStopLong) ? activeStop : activeRunnerStopLong
+    nextRunnerStopLong = runnerStopLong
+    strategy.exit("L-TP1", from_entry="Long", limit=tp1Price, stop=activeStop, qty_percent=tp1QtyPct)
+    runnerStopBreachedLong = tp1Hit and low <= runnerStopLong
+    if runnerStopBreachedLong
+        if enableLogs
+            log.info(
+                 "多单Runner止损触发 | t={0} close={1} avgPrice={2} runnerStopInForce={3} low={4} high={5}",
+                 str.format_time(time, "yyyy-MM-dd HH:mm"),
+                 close,
+                 strategy.position_avg_price,
+                 runnerStopLong,
+                 low,
+                 high
+            )
+        strategy.close("Long", comment="Runner Stop Breach", immediately=true)
+    if tp1Hit
+        if moveStopToBreakeven
+            nextRunnerStopLong := math.max(nextRunnerStopLong, strategy.position_avg_price)
+        nextRunnerStopLong := math.max(nextRunnerStopLong, ma169 - atrValue * trailAtrAfterTp1)
+    activeRunnerStopLong := nextRunnerStopLong
+    runnerStopLongMoved = tp1Hit and (na(lastLoggedRunnerStopLong) or nextRunnerStopLong >= lastLoggedRunnerStopLong + atrValue * runnerLogStepAtr)
+    if enableLogs and logPositionState and runnerStopLongMoved
+        log.info(
+             "多单Runner止损上移 | t={0} close={1} avgPrice={2} activeStop={3} tp1Price={4} tp1Hit={5} runnerStopInForce={6} runnerStopNext={7}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             close,
+             strategy.position_avg_price,
+             activeStop,
+             tp1Price,
+             tp1Hit,
+             runnerStopLong,
+             nextRunnerStopLong
+        )
+        lastLoggedRunnerStopLong := nextRunnerStopLong
+
+// ===== 平仓后重置 =====
+justClosedLong = strategy.position_size == 0 and strategy.position_size[1] > 0
+
+if justClosedLong
+    activeStop := na
+    activeRunnerStopLong := na
+    signalLow := na
+    tp1Price := na
+    tp1Hit := false
+    lastLoggedRunnerStopLong := na
+
+// ===== 图形标记 =====
+plotshape(longPullbackSignal, title="趋势回踩做多", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="PB多")
+plotshape(isChoppy, title="震荡过滤", style=shape.circle, location=location.bottom, color=color.new(color.gray, 10), size=size.tiny, text="震")
