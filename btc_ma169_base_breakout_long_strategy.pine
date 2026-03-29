@@ -1,0 +1,384 @@
+//@version=6
+strategy(
+     "BTC MA169 Base Breakout Long",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     commission_type=strategy.commission.percent,
+     commission_value=0.05
+)
+
+// 中文说明：
+// 这是“价格在 MA169 上方/附近形成震荡区，然后带量向上突破做多”的独立策略。
+// 允许震荡过程中短暂跌破 MA169，但要求跌破不能太深。
+// 核心目标是抓 4 小时级别里，均线附近整理后的趋势延续突破。
+
+// ===== 参数 =====
+maLen                   = input.int(169, "MA169长度", minval=1)
+maTrendLen              = input.int(200, "MA200长度", minval=1)
+atrLen                  = input.int(14, "ATR长度", minval=1)
+volumeLen               = input.int(20, "成交量均线长度", minval=1)
+maSlopeLookback         = input.int(10, "MA169上行确认根数", minval=1)
+
+baseLookback            = input.int(16, "震荡区回看K数", minval=5)
+nearMaAtrMult           = input.float(1.20, "收盘贴近169阈值(ATR倍数)", step=0.05, minval=0.1)
+allowBreakBelowAtr      = input.float(1.00, "允许跌破169最大深度(ATR倍数)", step=0.05, minval=0.1)
+minNearMaRatio          = input.float(0.45, "贴近169收盘最小比例", step=0.05, minval=0.1, maxval=1.0)
+minCloseAboveRatio      = input.float(0.50, "收在169上方最小比例", step=0.05, minval=0.1, maxval=1.0)
+baseRangeAtrMax         = input.float(8.0, "震荡区最大总波动(ATR倍数)", step=0.25, minval=1.0)
+baseCenterAtrMax        = input.float(1.80, "箱体中心偏离169最大距离(ATR倍数)", step=0.1, minval=0.1)
+baseLowAtrMax           = input.float(1.40, "箱体下沿低于169最大距离(ATR倍数)", step=0.1, minval=0.1)
+baseHighAtrMax          = input.float(4.80, "箱体上沿高于169最大距离(ATR倍数)", step=0.1, minval=0.1)
+maxBreakoutWaitBars     = input.int(32, "冻结震荡区后等待突破K数", minval=1)
+maxBreakoutAttempts     = input.int(3, "同一箱体最大突破尝试次数", minval=1)
+
+breakoutVolumeMult      = input.float(1.30, "突破放量倍数", step=0.05, minval=0.1)
+minBullBodyPct          = input.float(0.45, "突破K最小实体占比", step=0.05, minval=0.1, maxval=1.0)
+signalStopAtrBuffer     = input.float(0.30, "止损缓冲(ATR倍数)", step=0.05, minval=0)
+
+enableLogs              = input.bool(true, "启用调试日志")
+logBaseRejected         = input.bool(true, "记录震荡区被拦截原因")
+logRejectedCandidates   = input.bool(true, "记录候选突破被拦截原因")
+logPositionState        = input.bool(true, "记录持仓关键状态")
+logProbeBars            = input.bool(true, "记录关键K判定日志")
+logBaseArmEvents        = input.bool(true, "记录震荡区冻结事件")
+logBaseSnapshots        = input.bool(true, "记录潜在震荡区快照")
+
+// ===== 指标 =====
+ma169        = ta.sma(close, maLen)
+ma200        = ta.sma(close, maTrendLen)
+atrValue     = ta.atr(atrLen)
+safeAtrValue = math.max(atrValue, syminfo.mintick)
+volumeAvg    = ta.sma(volume, volumeLen)
+maRisingTrend = ma169 > ma169[maSlopeLookback]
+ma169_3d     = request.security(syminfo.tickerid, "3D", ta.sma(close, maLen), barmerge.gaps_off, barmerge.lookahead_off)
+above3dMa169 = close > ma169_3d
+
+plot(ma169, "MA169", color=color.green, linewidth=2)
+plot(ma200, "MA200", color=color.red, linewidth=2)
+plot(ma169_3d, "3D MA169", color=color.orange, linewidth=2)
+
+// ===== 市场状态 =====
+baseContext =
+     above3dMa169 and
+     close >= ma169 - atrValue * allowBreakBelowAtr and
+     close <= ma169 + atrValue * nearMaAtrMult * 3.0
+
+// ===== 震荡区识别 =====
+nearMaCount = math.sum(math.abs(close[1] - ma169[1]) <= atrValue[1] * nearMaAtrMult ? 1.0 : 0.0, baseLookback)
+closeAboveCount = math.sum(close[1] >= ma169[1] ? 1.0 : 0.0, baseLookback)
+deepBreakCount = math.sum(close[1] < ma169[1] - atrValue[1] * allowBreakBelowAtr ? 1.0 : 0.0, baseLookback)
+
+nearMaRatio = nearMaCount / baseLookback
+closeAboveRatio = closeAboveCount / baseLookback
+baseHigh = ta.highest(high[1], baseLookback)
+baseLow = ta.lowest(low[1], baseLookback)
+baseCenter = (baseHigh + baseLow) / 2.0
+baseRangeAtr = (baseHigh - baseLow) / safeAtrValue
+baseCenterAtr = math.abs(baseCenter - ma169) / safeAtrValue
+baseLowAtr = math.max(ma169 - baseLow, 0) / safeAtrValue
+baseHighAtr = math.max(baseHigh - ma169, 0) / safeAtrValue
+
+baseReady =
+     baseContext and
+     baseRangeAtr <= baseRangeAtrMax and
+     baseCenterAtr <= baseCenterAtrMax and
+     baseLowAtr <= baseLowAtrMax and
+     baseHighAtr <= baseHighAtrMax
+
+baseCandidate =
+     strategy.position_size == 0 and
+     baseContext and
+     math.abs(close - ma169) <= atrValue * nearMaAtrMult * 2.0
+
+baseSnapshotCandidate =
+     strategy.position_size == 0 and
+     (
+         closeAboveRatio >= math.max(minCloseAboveRatio * 0.7, 0.35) or
+         nearMaRatio >= math.max(minNearMaRatio * 0.7, 0.35)
+     ) and
+     baseRangeAtr <= baseRangeAtrMax * 1.35
+
+nearMaRatioOk = nearMaRatio >= minNearMaRatio
+closeAboveRatioOk = closeAboveRatio >= minCloseAboveRatio
+deepBreakOk = deepBreakCount <= 2
+baseRangeOk = baseRangeAtr <= baseRangeAtrMax
+baseCenterOk = baseCenterAtr <= baseCenterAtrMax
+baseLowOk = baseLowAtr <= baseLowAtrMax
+baseHighOk = baseHighAtr <= baseHighAtrMax
+
+if enableLogs and logBaseRejected and baseCandidate and not baseReady
+    log.info(
+         "震荡区被拦截 | t={0} closeAboveRatioOk={1} deepBreakOk={2} baseRangeOk={3} baseCenterOk={4} baseLowOk={5} baseHighOk={6} nearMaRatio={7} closeAboveRatio={8} deepBreakCount={9} baseRangeAtr={10} baseCenterAtr={11} baseLowAtr={12} baseHighAtr={13} baseContext={14} above3dMa169={15} ma169={16} ma200={17} ma169_3d={18} maRisingTrend={19}",
+         str.format_time(time, "yyyy-MM-dd HH:mm"),
+         closeAboveRatioOk,
+         deepBreakOk,
+         baseRangeOk,
+         baseCenterOk,
+         baseLowOk,
+         baseHighOk,
+         nearMaRatio,
+         closeAboveRatio,
+         deepBreakCount,
+         baseRangeAtr,
+         baseCenterAtr,
+         baseLowAtr,
+         baseHighAtr,
+         baseContext,
+         above3dMa169,
+         ma169,
+         ma200,
+         ma169_3d,
+         maRisingTrend
+    )
+
+if enableLogs and logBaseSnapshots and baseSnapshotCandidate
+    log.info(
+         "潜在震荡区快照 | t={0} baseContext={1} baseReady={2} above3dMa169={3} nearMaRatio={4} closeAboveRatio={5} deepBreakCount={6} baseRangeAtr={7} baseCenterAtr={8} baseLowAtr={9} baseHighAtr={10} baseHigh={11} baseLow={12} ma169={13} ma200={14} ma169_3d={15}",
+         str.format_time(time, "yyyy-MM-dd HH:mm"),
+         baseContext,
+         baseReady,
+         above3dMa169,
+         nearMaRatio,
+         closeAboveRatio,
+         deepBreakCount,
+         baseRangeAtr,
+         baseCenterAtr,
+         baseLowAtr,
+         baseHighAtr,
+         baseHigh,
+         baseLow,
+         ma169,
+         ma200
+         ,
+         ma169_3d
+    )
+
+// ===== 突破信号 =====
+barRange = math.max(high - low, syminfo.mintick)
+bullBodyPct = (close - open) / barRange
+volumeOk = volume > volumeAvg * breakoutVolumeMult
+
+// ===== 仓位状态 =====
+var float activeStop = na
+var int entryBarIndex = na
+var bool baseArmed = false
+var float armedBaseHigh = na
+var float armedBaseLow = na
+var float armedNearMaRatio = na
+var float armedCloseAboveRatio = na
+var int armedBaseBarIndex = na
+var int armedDeepBreakCount = na
+var float armedBaseRangeAtr = na
+var float armedBaseCenterAtr = na
+var float armedBaseLowAtr = na
+var float armedBaseHighAtr = na
+var int armedAttemptCount = 0
+
+// ===== 冻结震荡区 =====
+if strategy.position_size == 0 and baseReady
+    refreshedExistingBase = baseArmed
+    baseArmed := true
+    armedBaseHigh := baseHigh
+    armedBaseLow := baseLow
+    armedNearMaRatio := nearMaRatio
+    armedCloseAboveRatio := closeAboveRatio
+    armedBaseBarIndex := bar_index
+    armedDeepBreakCount := int(deepBreakCount)
+    armedBaseRangeAtr := baseRangeAtr
+    armedBaseCenterAtr := baseCenterAtr
+    armedBaseLowAtr := baseLowAtr
+    armedBaseHighAtr := baseHighAtr
+    if not refreshedExistingBase
+        armedAttemptCount := 0
+    if enableLogs and logBaseArmEvents
+        log.info(
+             "冻结震荡区 | t={0} refreshedExistingBase={1} armedBaseHigh={2} armedBaseLow={3} nearMaRatio={4} closeAboveRatio={5} deepBreakCount={6} baseRangeAtr={7} baseCenterAtr={8} baseLowAtr={9} baseHighAtr={10} attemptCount={11} barsLookback={12}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             refreshedExistingBase,
+             armedBaseHigh,
+             armedBaseLow,
+             armedNearMaRatio,
+             armedCloseAboveRatio,
+             armedDeepBreakCount,
+             armedBaseRangeAtr,
+             armedBaseCenterAtr,
+             armedBaseLowAtr,
+             armedBaseHighAtr,
+             armedAttemptCount,
+             baseLookback
+        )
+
+armedTimedOut = baseArmed and not na(armedBaseBarIndex) and bar_index - armedBaseBarIndex > maxBreakoutWaitBars
+armedDeepBreakNow = baseArmed and close < ma169 - atrValue * allowBreakBelowAtr
+armedAttemptsExceeded = baseArmed and armedAttemptCount >= maxBreakoutAttempts
+
+if strategy.position_size == 0 and (armedTimedOut or armedDeepBreakNow or armedAttemptsExceeded)
+    if enableLogs and logProbeBars and baseArmed
+        log.info(
+             "冻结震荡区失效 | t={0} armedTimedOut={1} armedDeepBreakNow={2} armedAttemptsExceeded={3} barsSinceArmed={4} armedBaseHigh={5} armedBaseLow={6} attemptCount={7} ma169={8} low={9}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             armedTimedOut,
+             armedDeepBreakNow,
+             armedAttemptsExceeded,
+             bar_index - armedBaseBarIndex,
+             armedBaseHigh,
+             armedBaseLow,
+             armedAttemptCount,
+             ma169,
+             low
+        )
+    baseArmed := false
+    armedBaseHigh := na
+    armedBaseLow := na
+    armedNearMaRatio := na
+    armedCloseAboveRatio := na
+    armedBaseBarIndex := na
+    armedDeepBreakCount := na
+    armedBaseRangeAtr := na
+    armedBaseCenterAtr := na
+    armedBaseLowAtr := na
+    armedBaseHighAtr := na
+    armedAttemptCount := 0
+
+// ===== 入场 =====
+breakoutBarArmed = baseArmed and close > armedBaseHigh and close > open and bullBodyPct >= minBullBodyPct
+breakoutCandidate = strategy.position_size == 0 and baseArmed and close >= armedBaseHigh * 0.995
+probeCandidate =
+     strategy.position_size == 0 and
+     baseContext and
+     (
+         baseReady or
+         baseCandidate or
+         baseArmed or
+         breakoutCandidate
+     )
+breakoutSignal =
+     strategy.position_size == 0 and
+     baseArmed and
+     armedAttemptCount < maxBreakoutAttempts and
+     breakoutBarArmed and
+     volumeOk
+
+if enableLogs and logRejectedCandidates and breakoutCandidate and not breakoutSignal
+    log.info(
+         "候选突破被拦截 | t={0} baseArmed={1} volumeOk={2} breakoutBar={3} armedBaseHigh={4} armedBaseLow={5} armedNearMaRatio={6} armedCloseAboveRatio={7} armedDeepBreakCount={8} armedBaseRangeAtr={9} armedBaseCenterAtr={10} armedBaseLowAtr={11} armedBaseHighAtr={12} attemptCount={13}",
+         str.format_time(time, "yyyy-MM-dd HH:mm"),
+         baseArmed,
+         volumeOk,
+         breakoutBarArmed,
+         armedBaseHigh,
+         armedBaseLow,
+         armedNearMaRatio,
+         armedCloseAboveRatio,
+         armedDeepBreakCount,
+         armedBaseRangeAtr,
+         armedBaseCenterAtr,
+         armedBaseLowAtr,
+         armedBaseHighAtr,
+         armedAttemptCount
+    )
+
+if enableLogs and logProbeBars and probeCandidate
+    log.info(
+         "关键K评估 | t={0} baseContext={1} baseReady={2} baseCandidate={3} baseArmed={4} breakoutCandidate={5} breakoutSignal={6} volumeOk={7} breakoutBar={8} above3dMa169={9} nearMaRatio={10} closeAboveRatio={11} deepBreakCount={12} baseRangeAtr={13} baseCenterAtr={14} baseLowAtr={15} baseHighAtr={16} armedBaseHigh={17} armedBaseLow={18} armedNearMaRatio={19} armedCloseAboveRatio={20} armedDeepBreakCount={21} armedBaseRangeAtr={22} armedBaseCenterAtr={23} armedBaseLowAtr={24} armedBaseHighAtr={25} attemptCount={26} close={27} ma169={28} ma200={29} ma169_3d={30} maRisingTrend={31}",
+         str.format_time(time, "yyyy-MM-dd HH:mm"),
+         baseContext,
+         baseReady,
+         baseCandidate,
+         baseArmed,
+         breakoutCandidate,
+         breakoutSignal,
+         volumeOk,
+         breakoutBarArmed,
+         above3dMa169,
+         nearMaRatio,
+         closeAboveRatio,
+         deepBreakCount,
+         baseRangeAtr,
+         baseCenterAtr,
+         baseLowAtr,
+         baseHighAtr,
+         armedBaseHigh,
+         armedBaseLow,
+         armedNearMaRatio,
+         armedCloseAboveRatio,
+         armedDeepBreakCount,
+         armedBaseRangeAtr,
+         armedBaseCenterAtr,
+         armedBaseLowAtr,
+         armedBaseHighAtr,
+         armedAttemptCount,
+         close,
+         ma169,
+         ma200,
+         ma169_3d,
+         maRisingTrend
+    )
+
+if breakoutSignal
+    entryBaseHigh = armedBaseHigh
+    entryBaseLow = armedBaseLow
+    entryNearMaRatio = armedNearMaRatio
+    entryCloseAboveRatio = armedCloseAboveRatio
+    entryBaseCenterAtr = armedBaseCenterAtr
+    entryBaseLowAtr = armedBaseLowAtr
+    entryBaseHighAtr = armedBaseHighAtr
+    entryAttemptNumber = armedAttemptCount + 1
+    activeStop := low - atrValue * signalStopAtrBuffer
+    entryBarIndex := bar_index
+    armedAttemptCount += 1
+    strategy.entry("Long", strategy.long, comment="Base Breakout Long")
+    strategy.exit("L-Stop", from_entry="Long", stop=activeStop)
+    if enableLogs
+        log.info(
+             "震荡带量突破做多 | t={0} stop={1} armedBaseHigh={2} armedBaseLow={3} nearMaRatio={4} closeAboveRatio={5} baseCenterAtr={6} baseLowAtr={7} baseHighAtr={8} attemptNumber={9}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             activeStop,
+             entryBaseHigh,
+             entryBaseLow,
+             entryNearMaRatio,
+             entryCloseAboveRatio,
+             entryBaseCenterAtr,
+             entryBaseLowAtr,
+             entryBaseHighAtr,
+             entryAttemptNumber
+        )
+
+// ===== 持仓管理 =====
+if strategy.position_size > 0 and not na(activeStop)
+    bodyBelowMa169 = math.max(open, close) < ma169
+    if bodyBelowMa169
+        if enableLogs and logPositionState
+            log.info(
+                 "实体收在169下方止损 | t={0} close={1} avgPrice={2} ma169={3} open={4} barsHeld={5}",
+                 str.format_time(time, "yyyy-MM-dd HH:mm"),
+                 close,
+                 strategy.position_avg_price,
+                 ma169,
+                 open,
+                 bar_index - entryBarIndex
+            )
+        strategy.close("Long", comment="Body Below MA169 Exit")
+    else if enableLogs and logPositionState
+        log.info(
+             "多单持仓状态 | t={0} close={1} avgPrice={2} activeStop={3} ma169={4} barsHeld={5}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             close,
+             strategy.position_avg_price,
+             activeStop,
+             ma169,
+             bar_index - entryBarIndex
+        )
+
+// ===== 平仓后重置 =====
+justClosedLong = strategy.position_size == 0 and strategy.position_size[1] > 0
+
+if justClosedLong
+    activeStop := na
+    entryBarIndex := na
+
+// ===== 图形标记 =====
+bgcolor(baseReady ? color.new(color.blue, 92) : na, title="震荡区")
+plotshape(breakoutSignal, title="震荡突破做多", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="突多")
