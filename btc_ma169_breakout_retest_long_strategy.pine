@@ -1,6 +1,6 @@
 //@version=6
 strategy(
-     "BTC MA169 Base Breakout Long",
+     "BTC MA169 Base Breakout Retest Long",
      overlay=true,
      initial_capital=10000,
      default_qty_type=strategy.percent_of_equity,
@@ -10,9 +10,9 @@ strategy(
 )
 
 // 中文说明：
-// 这是“价格在 MA169 上方/附近形成震荡区，然后带量向上突破做多”的独立策略。
-// 允许震荡过程中短暂跌破 MA169，但要求跌破不能太深。
-// 核心目标是抓 4 小时级别里，均线附近整理后的趋势延续突破。
+// 这是“先在 MA169 附近震荡并放量突破，再等第一次回踩 MA169 做多”的独立策略。
+// 突破定义沿用 base_breakout 版本；开仓与离场结构沿用回踩策略的风控思路。
+// 关键约束是：突破后的第一次触碰 169 必须当根决定结果，要么开仓，要么失效。
 
 // ===== 参数 =====
 maLen                   = input.int(169, "MA169长度", minval=1)
@@ -35,22 +35,27 @@ maxBreakoutAttempts     = input.int(3, "同一箱体最大突破尝试次数", m
 
 breakoutVolumeMult      = input.float(1.30, "突破放量倍数", step=0.05, minval=0.1)
 minBullBodyPct          = input.float(0.45, "突破K最小实体占比", step=0.05, minval=0.1, maxval=1.0)
-signalStopAtrBuffer     = input.float(0.30, "止损缓冲(ATR倍数)", step=0.05, minval=0)
+
+touchAtrTolerance       = input.float(0.20, "回踩贴近169容差(ATR倍数)", step=0.05, minval=0)
+pullbackPierceAtr       = input.float(0.50, "回踩允许穿透169深度(ATR倍数)", step=0.05, minval=0)
+minExitReboundAtr       = input.float(1.0, "离场前至少再次拉离169多少ATR", step=0.1, minval=0.1)
+signalStopAtrBuffer     = input.float(0.30, "信号K止损缓冲(ATR倍数)", step=0.05, minval=0)
 
 enableLogs              = input.bool(true, "启用调试日志")
 logBaseRejected         = input.bool(true, "记录震荡区被拦截原因")
-logRejectedCandidates   = input.bool(true, "记录候选突破被拦截原因")
+logRejectedCandidates   = input.bool(true, "记录候选突破/回踩被拦截原因")
 logPositionState        = input.bool(true, "记录持仓关键状态")
 logProbeBars            = input.bool(true, "记录关键K判定日志")
 logBaseArmEvents        = input.bool(true, "记录震荡区冻结事件")
 logBaseSnapshots        = input.bool(true, "记录潜在震荡区快照")
+logRetestState          = input.bool(true, "记录突破后等待回踩状态")
 
 // ===== 指标 =====
-ma169        = ta.sma(close, maLen)
-ma200        = ta.sma(close, maTrendLen)
-atrValue     = ta.atr(atrLen)
-safeAtrValue = math.max(atrValue, syminfo.mintick)
-volumeAvg    = ta.sma(volume, volumeLen)
+ma169         = ta.sma(close, maLen)
+ma200         = ta.sma(close, maTrendLen)
+atrValue      = ta.atr(atrLen)
+safeAtrValue  = math.max(atrValue, syminfo.mintick)
+volumeAvg     = ta.sma(volume, volumeLen)
 maRisingTrend = ma169 > ma169[maSlopeLookback]
 
 plot(ma169, "MA169", color=color.green, linewidth=2)
@@ -83,37 +88,31 @@ baseReady =
      baseLowAtr <= baseLowAtrMax and
      baseHighAtr <= baseHighAtrMax
 
+var bool retestPending = false
+var int pendingBreakoutBarIndex = na
+var float pendingBreakoutHigh = na
+var float pendingBreakoutLow = na
+var int pendingBreakoutAttempt = na
+
 baseCandidate =
      strategy.position_size == 0 and
+     not retestPending and
      baseContext and
      math.abs(close - ma169) <= atrValue * nearMaAtrMult * 2.0
 
 baseSnapshotCandidate =
      strategy.position_size == 0 and
+     not retestPending and
      (
          closeAboveRatio >= math.max(minCloseAboveRatio * 0.7, 0.35) or
          nearMaRatio >= math.max(minNearMaRatio * 0.7, 0.35)
      ) and
      baseRangeAtr <= baseRangeAtrMax * 1.35
 
-nearMaRatioOk = nearMaRatio >= minNearMaRatio
-closeAboveRatioOk = closeAboveRatio >= minCloseAboveRatio
-deepBreakOk = deepBreakCount <= 2
-baseRangeOk = baseRangeAtr <= baseRangeAtrMax
-baseCenterOk = baseCenterAtr <= baseCenterAtrMax
-baseLowOk = baseLowAtr <= baseLowAtrMax
-baseHighOk = baseHighAtr <= baseHighAtrMax
-
 if enableLogs and logBaseRejected and baseCandidate and not baseReady
     log.info(
-         "震荡区被拦截 | t={0} closeAboveRatioOk={1} deepBreakOk={2} baseRangeOk={3} baseCenterOk={4} baseLowOk={5} baseHighOk={6} nearMaRatio={7} closeAboveRatio={8} deepBreakCount={9} baseRangeAtr={10} baseCenterAtr={11} baseLowAtr={12} baseHighAtr={13} baseContext={14} ma169={15} ma200={16} maRisingTrend={17}",
+         "震荡区被拦截 | t={0} nearMaRatio={1} closeAboveRatio={2} deepBreakCount={3} baseRangeAtr={4} baseCenterAtr={5} baseLowAtr={6} baseHighAtr={7} baseContext={8} ma169={9} ma200={10} maRisingTrend={11}",
          str.format_time(time, "yyyy-MM-dd HH:mm"),
-         closeAboveRatioOk,
-         deepBreakOk,
-         baseRangeOk,
-         baseCenterOk,
-         baseLowOk,
-         baseHighOk,
          nearMaRatio,
          closeAboveRatio,
          deepBreakCount,
@@ -151,9 +150,12 @@ barRange = math.max(high - low, syminfo.mintick)
 bullBodyPct = (close - open) / barRange
 volumeOk = volume > volumeAvg * breakoutVolumeMult
 
-// ===== 仓位状态 =====
+// ===== 仓位与状态 =====
 var float activeStop = na
+var float signalLow = na
 var int entryBarIndex = na
+var bool exitRetouchArmed = false
+
 var bool baseArmed = false
 var float armedBaseHigh = na
 var float armedBaseLow = na
@@ -168,7 +170,7 @@ var float armedBaseHighAtr = na
 var int armedAttemptCount = 0
 
 // ===== 冻结震荡区 =====
-if strategy.position_size == 0 and baseReady
+if strategy.position_size == 0 and not retestPending and baseReady
     refreshedExistingBase = baseArmed
     baseArmed := true
     armedBaseHigh := baseHigh
@@ -205,7 +207,7 @@ armedTimedOut = baseArmed and not na(armedBaseBarIndex) and bar_index - armedBas
 armedDeepBreakNow = baseArmed and close < ma169 - atrValue * allowBreakBelowAtr
 armedAttemptsExceeded = baseArmed and armedAttemptCount >= maxBreakoutAttempts
 
-if strategy.position_size == 0 and (armedTimedOut or armedDeepBreakNow or armedAttemptsExceeded)
+if strategy.position_size == 0 and not retestPending and (armedTimedOut or armedDeepBreakNow or armedAttemptsExceeded)
     if enableLogs and logProbeBars and baseArmed
         log.info(
              "冻结震荡区失效 | t={0} armedTimedOut={1} armedDeepBreakNow={2} armedAttemptsExceeded={3} barsSinceArmed={4} armedBaseHigh={5} armedBaseLow={6} attemptCount={7} ma169={8} low={9}",
@@ -233,20 +235,21 @@ if strategy.position_size == 0 and (armedTimedOut or armedDeepBreakNow or armedA
     armedBaseHighAtr := na
     armedAttemptCount := 0
 
-// ===== 入场 =====
+// ===== 突破后等待回踩 =====
 breakoutBarArmed = baseArmed and close > armedBaseHigh and close > open and bullBodyPct >= minBullBodyPct
-breakoutCandidate = strategy.position_size == 0 and baseArmed and close >= armedBaseHigh * 0.995
+breakoutCandidate = strategy.position_size == 0 and not retestPending and baseArmed and close >= armedBaseHigh * 0.995
 probeCandidate =
      strategy.position_size == 0 and
-     baseContext and
      (
          baseReady or
          baseCandidate or
          baseArmed or
-         breakoutCandidate
+         breakoutCandidate or
+         retestPending
      )
 breakoutSignal =
      strategy.position_size == 0 and
+     not retestPending and
      baseArmed and
      armedAttemptCount < maxBreakoutAttempts and
      breakoutBarArmed and
@@ -273,92 +276,137 @@ if enableLogs and logRejectedCandidates and breakoutCandidate and not breakoutSi
 
 if enableLogs and logProbeBars and probeCandidate
     log.info(
-         "关键K评估 | t={0} baseContext={1} baseReady={2} baseCandidate={3} baseArmed={4} breakoutCandidate={5} breakoutSignal={6} volumeOk={7} breakoutBar={8} nearMaRatio={9} closeAboveRatio={10} deepBreakCount={11} baseRangeAtr={12} baseCenterAtr={13} baseLowAtr={14} baseHighAtr={15} armedBaseHigh={16} armedBaseLow={17} armedNearMaRatio={18} armedCloseAboveRatio={19} armedDeepBreakCount={20} armedBaseRangeAtr={21} armedBaseCenterAtr={22} armedBaseLowAtr={23} armedBaseHighAtr={24} attemptCount={25} close={26} ma169={27} ma200={28} maRisingTrend={29}",
+         "关键K评估 | t={0} baseContext={1} baseReady={2} baseArmed={3} breakoutCandidate={4} breakoutSignal={5} volumeOk={6} breakoutBar={7} retestPending={8} pendingBreakoutBarIndex={9} close={10} ma169={11} ma200={12} nearMaRatio={13} closeAboveRatio={14} deepBreakCount={15}",
          str.format_time(time, "yyyy-MM-dd HH:mm"),
          baseContext,
          baseReady,
-         baseCandidate,
          baseArmed,
          breakoutCandidate,
          breakoutSignal,
          volumeOk,
          breakoutBarArmed,
-         nearMaRatio,
-         closeAboveRatio,
-         deepBreakCount,
-         baseRangeAtr,
-         baseCenterAtr,
-         baseLowAtr,
-         baseHighAtr,
-         armedBaseHigh,
-         armedBaseLow,
-         armedNearMaRatio,
-         armedCloseAboveRatio,
-         armedDeepBreakCount,
-         armedBaseRangeAtr,
-         armedBaseCenterAtr,
-         armedBaseLowAtr,
-         armedBaseHighAtr,
-         armedAttemptCount,
+         retestPending,
+         pendingBreakoutBarIndex,
          close,
          ma169,
          ma200,
-         maRisingTrend
+         nearMaRatio,
+         closeAboveRatio,
+         deepBreakCount
     )
 
 if breakoutSignal
-    entryBaseHigh = armedBaseHigh
-    entryBaseLow = armedBaseLow
-    entryNearMaRatio = armedNearMaRatio
-    entryCloseAboveRatio = armedCloseAboveRatio
-    entryBaseCenterAtr = armedBaseCenterAtr
-    entryBaseLowAtr = armedBaseLowAtr
-    entryBaseHighAtr = armedBaseHighAtr
-    entryAttemptNumber = armedAttemptCount + 1
+    pendingBreakoutHigh := armedBaseHigh
+    pendingBreakoutLow := armedBaseLow
+    pendingBreakoutAttempt := armedAttemptCount + 1
+    pendingBreakoutBarIndex := bar_index
+    retestPending := true
+    baseArmed := false
+    armedBaseHigh := na
+    armedBaseLow := na
+    armedNearMaRatio := na
+    armedCloseAboveRatio := na
+    armedBaseBarIndex := na
+    armedDeepBreakCount := na
+    armedBaseRangeAtr := na
+    armedBaseCenterAtr := na
+    armedBaseLowAtr := na
+    armedBaseHighAtr := na
+    armedAttemptCount := 0
+    if enableLogs and logRetestState
+        log.info(
+             "震荡突破确认，开始等待首次回踩 | t={0} breakoutBarIndex={1} pendingBreakoutHigh={2} pendingBreakoutLow={3} pendingBreakoutAttempt={4}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             pendingBreakoutBarIndex,
+             pendingBreakoutHigh,
+             pendingBreakoutLow,
+             pendingBreakoutAttempt
+        )
+
+retestTouchZone = low <= ma169 + atrValue * touchAtrTolerance
+retestValidPierce = low >= ma169 - atrValue * pullbackPierceAtr
+firstRetestTouch =
+     strategy.position_size == 0 and
+     retestPending and
+     not na(pendingBreakoutBarIndex) and
+     bar_index > pendingBreakoutBarIndex and
+     retestTouchZone
+
+longRetestSignal =
+     firstRetestTouch and
+     retestValidPierce and
+     close > ma169
+
+retestFailed = firstRetestTouch and not longRetestSignal
+
+if enableLogs and logRejectedCandidates and firstRetestTouch and retestFailed
+    log.info(
+         "首次回踩失效 | t={0} close={1} ma169={2} retestValidPierce={3} low={4} pendingBreakoutHigh={5} pendingBreakoutLow={6}",
+         str.format_time(time, "yyyy-MM-dd HH:mm"),
+         close,
+         ma169,
+         retestValidPierce,
+         low,
+         pendingBreakoutHigh,
+         pendingBreakoutLow
+    )
+
+// ===== 入场 =====
+if longRetestSignal
+    entryPendingAttempt = pendingBreakoutAttempt
+    signalLow := low
     activeStop := low - atrValue * signalStopAtrBuffer
     entryBarIndex := bar_index
-    armedAttemptCount += 1
-    strategy.entry("Long", strategy.long, comment="Base Breakout Long")
+    exitRetouchArmed := false
+    retestPending := false
+    pendingBreakoutBarIndex := na
+    pendingBreakoutHigh := na
+    pendingBreakoutLow := na
+    pendingBreakoutAttempt := na
+    strategy.entry("Long", strategy.long, comment="Breakout Retest Long")
     strategy.exit("L-Stop", from_entry="Long", stop=activeStop)
-    if enableLogs
+    if enableLogs and logRetestState
         log.info(
-             "震荡带量突破做多 | t={0} stop={1} armedBaseHigh={2} armedBaseLow={3} nearMaRatio={4} closeAboveRatio={5} baseCenterAtr={6} baseLowAtr={7} baseHighAtr={8} attemptNumber={9}",
+             "突破后首次回踩做多 | t={0} signalLow={1} stop={2} pendingBreakoutAttempt={3}",
              str.format_time(time, "yyyy-MM-dd HH:mm"),
+             signalLow,
              activeStop,
-             entryBaseHigh,
-             entryBaseLow,
-             entryNearMaRatio,
-             entryCloseAboveRatio,
-             entryBaseCenterAtr,
-             entryBaseLowAtr,
-             entryBaseHighAtr,
-             entryAttemptNumber
+             entryPendingAttempt
         )
+else if retestFailed
+    retestPending := false
+    pendingBreakoutBarIndex := na
+    pendingBreakoutHigh := na
+    pendingBreakoutLow := na
+    pendingBreakoutAttempt := na
 
 // ===== 持仓管理 =====
 if strategy.position_size > 0 and not na(activeStop)
-    bodyBelowMa169 = math.max(open, close) < ma169
-    if bodyBelowMa169
+    if high >= ma169 + atrValue * minExitReboundAtr
+        exitRetouchArmed := true
+    touchExitSignal = exitRetouchArmed and not na(entryBarIndex) and bar_index > entryBarIndex and low <= ma169 + atrValue * touchAtrTolerance
+    if touchExitSignal
         if enableLogs and logPositionState
             log.info(
-                 "实体收在169下方止损 | t={0} close={1} avgPrice={2} ma169={3} open={4} barsHeld={5}",
+                 "再次触碰169离场 | t={0} close={1} avgPrice={2} ma169={3} low={4} barsHeld={5}",
                  str.format_time(time, "yyyy-MM-dd HH:mm"),
                  close,
                  strategy.position_avg_price,
                  ma169,
-                 open,
+                 low,
                  bar_index - entryBarIndex
             )
-        strategy.close("Long", comment="Body Below MA169 Exit")
+        strategy.close("Long", comment="Touch MA169 Exit")
     else if enableLogs and logPositionState
         log.info(
-             "多单持仓状态 | t={0} close={1} avgPrice={2} activeStop={3} ma169={4} barsHeld={5}",
+             "多单持仓状态 | t={0} close={1} avgPrice={2} activeStop={3} ma169={4} barsHeld={5} exitRetouchArmed={6}",
              str.format_time(time, "yyyy-MM-dd HH:mm"),
              close,
              strategy.position_avg_price,
              activeStop,
              ma169,
-             bar_index - entryBarIndex
+             bar_index - entryBarIndex,
+             exitRetouchArmed
         )
 
 // ===== 平仓后重置 =====
@@ -366,8 +414,12 @@ justClosedLong = strategy.position_size == 0 and strategy.position_size[1] > 0
 
 if justClosedLong
     activeStop := na
+    signalLow := na
     entryBarIndex := na
+    exitRetouchArmed := false
 
 // ===== 图形标记 =====
-bgcolor(baseReady ? color.new(color.blue, 92) : na, title="震荡区")
-plotshape(breakoutSignal, title="震荡突破做多", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="突多")
+bgcolor(retestPending ? color.new(color.orange, 88) : baseReady ? color.new(color.blue, 92) : na, title="状态背景")
+plotshape(breakoutSignal, title="震荡突破待回踩", style=shape.circle, location=location.abovebar, color=color.orange, size=size.tiny, text="待PB")
+plotshape(longRetestSignal, title="突破后回踩做多", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="PB多")
+plotshape(retestFailed, title="首次回踩失效", style=shape.xcross, location=location.abovebar, color=color.red, size=size.tiny, text="失效")
