@@ -1,0 +1,131 @@
+//@version=6
+strategy(
+     "BTC MA169 Reclaim First Retest Long",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     commission_type=strategy.commission.percent,
+     commission_value=0.05
+)
+
+// 中文说明：
+// 这是“价格在 MA169 上方运行一段时间且近期没有触碰 MA169 后，
+// 第一次回踩 MA169 并收回时做多”的独立策略。
+// 重点是过滤均线附近反复上下来回穿插的行情。
+
+// ===== 参数 =====
+maLen                     = input.int(169, "MA169长度", minval=1)
+atrLen                    = input.int(14, "ATR长度", minval=1)
+
+entryNoTouchLookback      = input.int(15, "回踩前未触碰169回看K数", minval=1)
+noTouchAtrBuffer          = input.float(0.05, "未触碰安全距离(ATR倍数)", step=0.01, minval=0)
+
+enableLogs                = input.bool(true, "启用调试日志")
+logEveryBar               = input.bool(true, "逐根记录完整判定")
+logRejectedCandidates     = input.bool(true, "记录候选站上/回踩被拦截原因")
+logState                  = input.bool(true, "记录等待回踩/持仓状态")
+
+// ===== 指标 =====
+ma169        = ta.sma(close, maLen)
+atrValue     = ta.atr(atrLen)
+safeAtrValue = math.max(atrValue, syminfo.mintick)
+
+plot(ma169, "MA169", color=color.green, linewidth=2)
+
+// ===== 状态 =====
+var int entryBarIndex = na
+
+// ===== 回踩判定 =====
+firstRetestTouch =
+     strategy.position_size == 0 and
+     low < ma169
+
+priorEntryTouchCount = math.sum(low[1] <= ma169[1] + safeAtrValue[1] * noTouchAtrBuffer and high[1] >= ma169[1] - safeAtrValue[1] * noTouchAtrBuffer ? 1.0 : 0.0, entryNoTouchLookback)
+priorAboveCount = math.sum(close[1] > ma169[1] ? 1.0 : 0.0, entryNoTouchLookback)
+entryPriorNoTouch = not na(ma169[entryNoTouchLookback]) and priorEntryTouchCount == 0
+entryPriorAbove = not na(ma169[entryNoTouchLookback]) and priorAboveCount == entryNoTouchLookback
+retestCloseBackAbove = close > ma169
+
+longRetestSignal =
+     firstRetestTouch and
+     retestCloseBackAbove and
+     entryPriorNoTouch and
+     entryPriorAbove
+
+retestFailed = firstRetestTouch and not longRetestSignal
+
+if enableLogs and logEveryBar
+    log.info(
+         "逐根判定 | t={0} bar_index={1} pos={2} open={3} high={4} low={5} close={6} ma169={7} firstRetestTouch={8} retestCloseBackAbove={9} entryPriorNoTouch={10} entryPriorAbove={11} priorEntryTouchCount={12} priorAboveCount={13} longRetestSignal={14} retestFailed={15}",
+         str.format_time(time, "yyyy-MM-dd HH:mm"),
+         bar_index,
+         strategy.position_size,
+         open,
+         high,
+         low,
+         close,
+         ma169,
+         firstRetestTouch,
+         retestCloseBackAbove,
+         entryPriorNoTouch,
+         entryPriorAbove,
+         priorEntryTouchCount,
+         priorAboveCount,
+         longRetestSignal,
+         retestFailed
+    )
+
+if enableLogs and logRejectedCandidates and retestFailed
+    log.info(
+         "第一次回踩失效 | t={0} close={1} low={2} ma169={3} retestCloseBackAbove={4} entryPriorNoTouch={5} entryPriorAbove={6} priorEntryTouchCount={7} priorAboveCount={8}",
+         str.format_time(time, "yyyy-MM-dd HH:mm"),
+         close,
+         low,
+         ma169,
+         retestCloseBackAbove,
+         entryPriorNoTouch,
+         entryPriorAbove,
+         priorEntryTouchCount,
+         priorAboveCount
+    )
+
+// ===== 入场 =====
+if longRetestSignal
+    entryBarIndex := bar_index
+    strategy.entry("Long", strategy.long, comment="MA169 First Retest Long")
+    if enableLogs and logState
+        log.info(
+             "第一次回踩不跌破169，做多 | t={0} low={1} ma169={2}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             low,
+             ma169
+        )
+
+// ===== 出场：进场后收盘跌回169下方 =====
+exitCloseBelowMa169 =
+     strategy.position_size > 0 and
+     not na(entryBarIndex) and
+     bar_index > entryBarIndex and
+     close < ma169
+
+if exitCloseBelowMa169
+    strategy.close("Long", comment="Close Below MA169 Stop")
+    if enableLogs and logState
+        log.info(
+             "进场后收盘跌回169下方止损 | t={0} close={1} ma169={2} barsHeld={3}",
+             str.format_time(time, "yyyy-MM-dd HH:mm"),
+             close,
+             ma169,
+             bar_index - entryBarIndex
+        )
+
+// ===== 平仓后重置 =====
+justClosedLong = strategy.position_size == 0 and strategy.position_size[1] > 0
+
+if justClosedLong
+    entryBarIndex := na
+
+// ===== 图形标记 =====
+plotshape(longRetestSignal, title="第一次回踩做多", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="PB多")
+plotshape(retestFailed, title="第一次回踩失效", style=shape.xcross, location=location.abovebar, color=color.red, size=size.tiny, text="失效")

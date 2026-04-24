@@ -16,19 +16,18 @@ strategy(
 
 // ===== 参数 =====
 maLen                   = input.int(169, "MA169长度", minval=1)
-maTrendLen              = input.int(200, "MA200长度", minval=1)
 atrLen                  = input.int(14, "ATR长度", minval=1)
 volumeLen               = input.int(20, "成交量均线长度", minval=1)
 maSlopeLookback         = input.int(10, "MA169上行确认根数", minval=1)
 
-baseLookback            = input.int(16, "震荡区回看K数", minval=5)
+baseLookback            = input.int(48, "震荡区回看K数", minval=5)
 nearMaAtrMult           = input.float(1.20, "收盘贴近169阈值(ATR倍数)", step=0.05, minval=0.1)
 allowBreakBelowAtr      = input.float(1.00, "允许跌破169最大深度(ATR倍数)", step=0.05, minval=0.1)
-minNearMaRatio          = input.float(0.45, "贴近169收盘最小比例", step=0.05, minval=0.1, maxval=1.0)
-minCloseAboveRatio      = input.float(0.50, "收在169上方最小比例", step=0.05, minval=0.1, maxval=1.0)
+minNearMaRatio          = input.float(0.30, "贴近169收盘最小比例", step=0.05, minval=0.1, maxval=1.0)
+minCloseAboveRatio      = input.float(0.35, "收在169上方最小比例", step=0.05, minval=0.1, maxval=1.0)
 baseRangeAtrMax         = input.float(8.0, "震荡区最大总波动(ATR倍数)", step=0.25, minval=1.0)
-baseCenterAtrMax        = input.float(1.80, "箱体中心偏离169最大距离(ATR倍数)", step=0.1, minval=0.1)
-baseLowAtrMax           = input.float(1.40, "箱体下沿低于169最大距离(ATR倍数)", step=0.1, minval=0.1)
+baseCenterAtrMax        = input.float(2.40, "箱体中心偏离169最大距离(ATR倍数)", step=0.1, minval=0.1)
+baseLowAtrMax           = input.float(4.00, "箱体下沿低于169最大距离(ATR倍数)", step=0.1, minval=0.1)
 baseHighAtrMax          = input.float(4.80, "箱体上沿高于169最大距离(ATR倍数)", step=0.1, minval=0.1)
 maxBreakoutWaitBars     = input.int(32, "冻结震荡区后等待突破K数", minval=1)
 maxBreakoutAttempts     = input.int(3, "同一箱体最大突破尝试次数", minval=1)
@@ -52,14 +51,12 @@ logRetestState          = input.bool(true, "记录突破后等待回踩状态")
 
 // ===== 指标 =====
 ma169         = ta.sma(close, maLen)
-ma200         = ta.sma(close, maTrendLen)
 atrValue      = ta.atr(atrLen)
 safeAtrValue  = math.max(atrValue, syminfo.mintick)
 volumeAvg     = ta.sma(volume, volumeLen)
 maRisingTrend = ma169 > ma169[maSlopeLookback]
 
 plot(ma169, "MA169", color=color.green, linewidth=2)
-plot(ma200, "MA200", color=color.red, linewidth=2)
 
 // ===== 市场状态 =====
 baseContext =
@@ -81,12 +78,19 @@ baseCenterAtr = math.abs(baseCenter - ma169) / safeAtrValue
 baseLowAtr = math.max(ma169 - baseLow, 0) / safeAtrValue
 baseHighAtr = math.max(baseHigh - ma169, 0) / safeAtrValue
 
+baseCloseAboveOk = closeAboveRatio >= minCloseAboveRatio
+baseRangeOk = baseRangeAtr <= baseRangeAtrMax
+baseCenterOk = baseCenterAtr <= baseCenterAtrMax
+baseLowOk = baseLowAtr <= baseLowAtrMax
+baseHighOk = baseHighAtr <= baseHighAtrMax
+
 baseReady =
      baseContext and
-     baseRangeAtr <= baseRangeAtrMax and
-     baseCenterAtr <= baseCenterAtrMax and
-     baseLowAtr <= baseLowAtrMax and
-     baseHighAtr <= baseHighAtrMax
+     baseCloseAboveOk and
+     baseRangeOk and
+     baseCenterOk and
+     baseLowOk and
+     baseHighOk
 
 var bool retestPending = false
 var int pendingBreakoutBarIndex = na
@@ -111,8 +115,13 @@ baseSnapshotCandidate =
 
 if enableLogs and logBaseRejected and baseCandidate and not baseReady
     log.info(
-         "震荡区被拦截 | t={0} nearMaRatio={1} closeAboveRatio={2} deepBreakCount={3} baseRangeAtr={4} baseCenterAtr={5} baseLowAtr={6} baseHighAtr={7} baseContext={8} ma169={9} ma200={10} maRisingTrend={11}",
+         "震荡区被拦截 | t={0} closeAboveOk={1} rangeOk={2} centerOk={3} lowOk={4} highOk={5} nearMaRatio={6} closeAboveRatio={7} deepBreakCount={8} baseRangeAtr={9} baseCenterAtr={10} baseLowAtr={11} baseHighAtr={12} baseContext={13} ma169={14} maRisingTrend={15}",
          str.format_time(time, "yyyy-MM-dd HH:mm"),
+         baseCloseAboveOk,
+         baseRangeOk,
+         baseCenterOk,
+         baseLowOk,
+         baseHighOk,
          nearMaRatio,
          closeAboveRatio,
          deepBreakCount,
@@ -122,13 +131,12 @@ if enableLogs and logBaseRejected and baseCandidate and not baseReady
          baseHighAtr,
          baseContext,
          ma169,
-         ma200,
          maRisingTrend
     )
 
 if enableLogs and logBaseSnapshots and baseSnapshotCandidate
     log.info(
-         "潜在震荡区快照 | t={0} baseContext={1} baseReady={2} nearMaRatio={3} closeAboveRatio={4} deepBreakCount={5} baseRangeAtr={6} baseCenterAtr={7} baseLowAtr={8} baseHighAtr={9} baseHigh={10} baseLow={11} ma169={12} ma200={13}",
+         "潜在震荡区快照 | t={0} baseContext={1} baseReady={2} nearMaRatio={3} closeAboveRatio={4} deepBreakCount={5} baseRangeAtr={6} baseCenterAtr={7} baseLowAtr={8} baseHighAtr={9} baseHigh={10} baseLow={11} ma169={12}",
          str.format_time(time, "yyyy-MM-dd HH:mm"),
          baseContext,
          baseReady,
@@ -141,8 +149,7 @@ if enableLogs and logBaseSnapshots and baseSnapshotCandidate
          baseHighAtr,
          baseHigh,
          baseLow,
-         ma169,
-         ma200
+         ma169
     )
 
 // ===== 突破信号 =====
@@ -276,7 +283,7 @@ if enableLogs and logRejectedCandidates and breakoutCandidate and not breakoutSi
 
 if enableLogs and logProbeBars and probeCandidate
     log.info(
-         "关键K评估 | t={0} baseContext={1} baseReady={2} baseArmed={3} breakoutCandidate={4} breakoutSignal={5} volumeOk={6} breakoutBar={7} retestPending={8} pendingBreakoutBarIndex={9} close={10} ma169={11} ma200={12} nearMaRatio={13} closeAboveRatio={14} deepBreakCount={15}",
+         "关键K评估 | t={0} baseContext={1} baseReady={2} baseArmed={3} breakoutCandidate={4} breakoutSignal={5} volumeOk={6} breakoutBar={7} retestPending={8} pendingBreakoutBarIndex={9} close={10} ma169={11} nearMaRatio={12} closeAboveRatio={13} deepBreakCount={14}",
          str.format_time(time, "yyyy-MM-dd HH:mm"),
          baseContext,
          baseReady,
@@ -289,7 +296,6 @@ if enableLogs and logProbeBars and probeCandidate
          pendingBreakoutBarIndex,
          close,
          ma169,
-         ma200,
          nearMaRatio,
          closeAboveRatio,
          deepBreakCount
